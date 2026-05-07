@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: starter           # $7/mo — keeps the service warm; use 'free' for testing
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 300 --workers 2 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --timeout 900 --workers 2 --bind 0.0.0.0:$PORT
     healthCheckPath: /healthz
     envVars:
       - key: ANTHROPIC_API_KEY
