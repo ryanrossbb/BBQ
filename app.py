@@ -28,7 +28,11 @@ log = logging.getLogger("quote-spreadsheeter")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload cap
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+# Beta headers needed for code execution and the Files API
+BETA_HEADERS = {
+    "anthropic-beta": "code-execution-2025-05-22,files-api-2025-04-14"
+}
+client = anthropic.Anthropic(default_headers=BETA_HEADERS)
 
 SKILL_DIR = Path(__file__).parent / "skill"
 SKILL_PROMPT = (SKILL_DIR / "SKILL.md").read_text()
@@ -40,66 +44,70 @@ SHARED_SECRET = os.environ.get("SHARED_SECRET")  # set in Render env vars
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
-def media_type_for(filename: str) -> str:
-    name = filename.lower()
-    if name.endswith(".pdf"):
-        return "application/pdf"
-    if name.endswith(".xlsx"):
-        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    if name.endswith(".xls"):
-        return "application/vnd.ms-excel"
-    if name.endswith(".csv"):
-        return "text/csv"
-    return "application/octet-stream"
+def is_pdf(filename: str) -> bool:
+    return filename.lower().endswith(".pdf")
 
 
-def file_to_block(file_storage) -> dict:
-    """Encode an uploaded file into an Anthropic content block."""
+def pdf_to_document_block(file_storage) -> dict:
+    """PDFs go inline as base64 document blocks — natively supported."""
     raw = file_storage.read()
     encoded = base64.standard_b64encode(raw).decode()
     return {
         "type": "document",
         "source": {
             "type": "base64",
-            "media_type": media_type_for(file_storage.filename),
+            "media_type": "application/pdf",
             "data": encoded,
         },
         "title": file_storage.filename,
     }
 
 
-def template_as_block() -> dict:
-    """The blank template, sent so Claude has something to populate."""
+def upload_file_get_id(file_storage_or_bytes, filename: str) -> str:
+    """
+    Upload a non-PDF file via the Files API and return its file_id.
+    Used for .xlsx, .csv, etc. — anything the document-block API doesn't accept inline.
+    """
+    if hasattr(file_storage_or_bytes, "read"):
+        data = file_storage_or_bytes.read()
+    else:
+        data = file_storage_or_bytes
+    uploaded = client.beta.files.upload(file=(filename, io.BytesIO(data)))
+    return uploaded.id
+
+
+def container_upload_block(file_id: str) -> dict:
+    """Reference an uploaded file from inside the conversation, available to code execution."""
     return {
-        "type": "document",
-        "source": {
-            "type": "base64",
-            "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "data": base64.standard_b64encode(TEMPLATE_BYTES).decode(),
-        },
-        "title": "Prost11_Medical_Comparison_TEMPLATE.xlsx",
+        "type": "container_upload",
+        "file_id": file_id,
     }
 
 
 def extract_xlsx_from_response(response) -> bytes | None:
     """
-    Walk the response content blocks looking for a generated .xlsx file.
-    Code-execution tool returns files as code_execution_tool_result blocks
-    containing file references with file_id we can fetch.
+    Walk response content for a generated .xlsx file from code execution.
+    Falls back to a heuristic check (zip magic bytes) since the file may be returned
+    as either a code_execution_tool_result or a direct file reference.
     """
     for block in response.content:
-        # Code execution results contain file outputs
-        if getattr(block, "type", None) == "code_execution_tool_result":
+        btype = getattr(block, "type", None)
+        if btype == "code_execution_tool_result":
             result = getattr(block, "content", None)
-            if result and getattr(result, "type", None) == "code_execution_result":
-                for f in getattr(result, "content", []) or []:
-                    if getattr(f, "type", None) == "code_execution_output":
-                        file_id = getattr(f, "file_id", None)
-                        if file_id:
-                            file_bytes = client.beta.files.download(file_id).read()
-                            # Heuristic: xlsx files start with PK (zip magic)
-                            if file_bytes[:2] == b"PK":
-                                return file_bytes
+            if not result:
+                continue
+            inner = getattr(result, "content", None) or []
+            for item in inner:
+                file_id = getattr(item, "file_id", None) or (
+                    item.get("file_id") if isinstance(item, dict) else None
+                )
+                if file_id:
+                    try:
+                        file_bytes = client.beta.files.download(file_id).read()
+                        if file_bytes[:2] == b"PK":  # xlsx is a zip file
+                            return file_bytes
+                    except Exception as e:
+                        log.warning(f"failed to download file {file_id}: {e}")
     return None
 
 
@@ -176,7 +184,11 @@ def spreadsheet_quotes():
     run_id = uuid.uuid4().hex[:8]
     log.info(f"[{run_id}] starting run: {len(files)} files, plans={plans!r}")
 
-    # Build the user message: instructions + template + uploaded files
+    # 1) Upload the template via Files API so code execution can open it
+    log.info(f"[{run_id}] uploading template via Files API")
+    template_id = upload_file_get_id(TEMPLATE_BYTES, "Prost11_Medical_Comparison_TEMPLATE.xlsx")
+
+    # 2) Build user content. PDFs go inline; non-PDFs go through Files API.
     user_content = [
         {
             "type": "text",
@@ -184,14 +196,23 @@ def spreadsheet_quotes():
                 f"Spreadsheet these quotes for the following plans: {plans}.\n\n"
                 "I've attached the BrokersBloc Medical Comparison template "
                 "(filename ends in TEMPLATE.xlsx) — populate a copy of it. "
-                "The other files are carrier quotes and the census."
+                "The other files are carrier quotes and the census. "
+                "Use the code execution tool to read inputs and write the populated template, "
+                "then make the resulting .xlsx file available as an output."
             ),
         },
-        template_as_block(),
+        container_upload_block(template_id),
     ]
-    for f in files:
-        user_content.append(file_to_block(f))
 
+    for f in files:
+        if is_pdf(f.filename):
+            user_content.append(pdf_to_document_block(f))
+        else:
+            log.info(f"[{run_id}] uploading non-PDF via Files API: {f.filename}")
+            fid = upload_file_get_id(f, f.filename)
+            user_content.append(container_upload_block(fid))
+
+    # 3) Call Claude with code execution enabled
     try:
         response = client.beta.messages.create(
             model=MODEL,
@@ -199,7 +220,6 @@ def spreadsheet_quotes():
             system=SKILL_PROMPT,
             messages=[{"role": "user", "content": user_content}],
             tools=[{"type": "code_execution_20250522", "name": "code_execution"}],
-            betas=["code-execution-2025-05-22", "files-api-2025-04-14"],
         )
     except anthropic.APIError as e:
         log.exception(f"[{run_id}] Claude API error")
@@ -209,7 +229,6 @@ def spreadsheet_quotes():
 
     xlsx_bytes = extract_xlsx_from_response(response)
     if not xlsx_bytes:
-        # Surface Claude's text reply so caller can see what happened
         text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
         msg = "\n".join(text_blocks) or "No file produced and no text response."
         log.warning(f"[{run_id}] no xlsx produced. Claude said: {msg[:500]}")
@@ -225,5 +244,4 @@ def spreadsheet_quotes():
 
 
 if __name__ == "__main__":
-    # Local dev only. In production, gunicorn runs the app.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)
