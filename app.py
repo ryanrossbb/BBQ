@@ -1,5 +1,8 @@
 """
-Quote Spreadsheeter — minimal Render-deployable backend.
+Quote Spreadsheeter — minimal Render-deployable backend (streaming version).
+
+Uses the Anthropic SDK's streaming interface so long-running code-execution calls
+don't hit Render's 300-second HTTP timeout.
 
 POST /api/spreadsheet-quotes
   form fields:
@@ -7,7 +10,7 @@ POST /api/spreadsheet-quotes
     documents — one or more files (carrier quotes + census)
   returns: populated .xlsx file as download
 
-GET /  — returns a tiny HTML form for manual testing.
+GET /  — minimal HTML form for manual testing.
 GET /healthz — health check for Render.
 """
 
@@ -28,7 +31,6 @@ log = logging.getLogger("quote-spreadsheeter")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB upload cap
 
-# Beta headers needed for code execution and the Files API
 BETA_HEADERS = {
     "anthropic-beta": "code-execution-2025-05-22,files-api-2025-04-14"
 }
@@ -37,10 +39,10 @@ client = anthropic.Anthropic(default_headers=BETA_HEADERS)
 SKILL_DIR = Path(__file__).parent / "skill"
 SKILL_PROMPT = (SKILL_DIR / "SKILL.md").read_text()
 TEMPLATE_PATH = SKILL_DIR / "assets" / "Prost11_Medical_Comparison.xlsx"
-TEMPLATE_BYTES = TEMPLATE_PATH.read_bytes()  # cache once at startup
+TEMPLATE_BYTES = TEMPLATE_PATH.read_bytes()
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
-SHARED_SECRET = os.environ.get("SHARED_SECRET")  # set in Render env vars
+SHARED_SECRET = os.environ.get("SHARED_SECRET")
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -49,7 +51,6 @@ def is_pdf(filename: str) -> bool:
 
 
 def pdf_to_document_block(file_storage) -> dict:
-    """PDFs go inline as base64 document blocks — natively supported."""
     raw = file_storage.read()
     encoded = base64.standard_b64encode(raw).decode()
     return {
@@ -64,10 +65,6 @@ def pdf_to_document_block(file_storage) -> dict:
 
 
 def upload_file_get_id(file_storage_or_bytes, filename: str) -> str:
-    """
-    Upload a non-PDF file via the Files API and return its file_id.
-    Used for .xlsx, .csv, etc. — anything the document-block API doesn't accept inline.
-    """
     if hasattr(file_storage_or_bytes, "read"):
         data = file_storage_or_bytes.read()
     else:
@@ -77,44 +74,36 @@ def upload_file_get_id(file_storage_or_bytes, filename: str) -> str:
 
 
 def container_upload_block(file_id: str) -> dict:
-    """Reference an uploaded file from inside the conversation, available to code execution."""
-    return {
-        "type": "container_upload",
-        "file_id": file_id,
-    }
+    return {"type": "container_upload", "file_id": file_id}
 
 
-def extract_xlsx_from_response(response) -> bytes | None:
-    """
-    Walk response content for a generated .xlsx file from code execution.
-    Falls back to a heuristic check (zip magic bytes) since the file may be returned
-    as either a code_execution_tool_result or a direct file reference.
-    """
-    for block in response.content:
+def extract_xlsx_from_message(final_message) -> bytes | None:
+    """Walk the streamed final message for a generated .xlsx file."""
+    for block in final_message.content:
         btype = getattr(block, "type", None)
-        if btype == "code_execution_tool_result":
-            result = getattr(block, "content", None)
-            if not result:
-                continue
-            inner = getattr(result, "content", None) or []
-            for item in inner:
-                file_id = getattr(item, "file_id", None) or (
-                    item.get("file_id") if isinstance(item, dict) else None
-                )
-                if file_id:
-                    try:
-                        file_bytes = client.beta.files.download(file_id).read()
-                        if file_bytes[:2] == b"PK":  # xlsx is a zip file
-                            return file_bytes
-                    except Exception as e:
-                        log.warning(f"failed to download file {file_id}: {e}")
+        if btype != "code_execution_tool_result":
+            continue
+        result = getattr(block, "content", None)
+        if not result:
+            continue
+        inner = getattr(result, "content", None) or []
+        for item in inner:
+            file_id = getattr(item, "file_id", None) or (
+                item.get("file_id") if isinstance(item, dict) else None
+            )
+            if file_id:
+                try:
+                    file_bytes = client.beta.files.download(file_id).read()
+                    if file_bytes[:2] == b"PK":
+                        return file_bytes
+                except Exception as e:
+                    log.warning(f"failed to download file {file_id}: {e}")
     return None
 
 
 def require_auth():
-    """Simple shared-secret check. Returns None if OK, or a Response if not."""
     if not SHARED_SECRET:
-        return None  # auth disabled (dev mode)
+        return None
     sent = request.headers.get("X-Shared-Secret") or request.form.get("secret")
     if sent != SHARED_SECRET:
         return Response("Unauthorized", status=401)
@@ -129,7 +118,6 @@ def healthz():
 
 @app.get("/")
 def index():
-    """Minimal HTML form for manual testing. Replace with your real frontend."""
     return """<!doctype html>
 <html><head><title>Quote Spreadsheeter — Test</title>
 <style>body{font:14px system-ui;max-width:560px;margin:40px auto;padding:0 16px}
@@ -152,7 +140,7 @@ button{margin-top:20px;padding:10px 20px;font:inherit;cursor:pointer}
 document.getElementById("f").onsubmit = async (e) => {
   e.preventDefault();
   const status = document.getElementById("status");
-  status.textContent = "Working... this can take 1–3 minutes.";
+  status.textContent = "Working... this can take 3–8 minutes.";
   try {
     const res = await fetch("/api/spreadsheet-quotes", {method:"POST", body:new FormData(e.target)});
     if (!res.ok) { status.textContent = "Error: " + (await res.text()); return; }
@@ -184,11 +172,11 @@ def spreadsheet_quotes():
     run_id = uuid.uuid4().hex[:8]
     log.info(f"[{run_id}] starting run: {len(files)} files, plans={plans!r}")
 
-    # 1) Upload the template via Files API so code execution can open it
+    # Upload template via Files API
     log.info(f"[{run_id}] uploading template via Files API")
     template_id = upload_file_get_id(TEMPLATE_BYTES, "Prost11_Medical_Comparison_TEMPLATE.xlsx")
 
-    # 2) Build user content. PDFs go inline; non-PDFs go through Files API.
+    # Build user content
     user_content = [
         {
             "type": "text",
@@ -212,24 +200,36 @@ def spreadsheet_quotes():
             fid = upload_file_get_id(f, f.filename)
             user_content.append(container_upload_block(fid))
 
-    # 3) Call Claude with code execution enabled
+    # Stream the response so the connection stays alive while Claude works.
+    # The streaming SDK handles SSE under the hood and gives us a final assembled message.
     try:
-        response = client.beta.messages.create(
+        with client.beta.messages.stream(
             model=MODEL,
             max_tokens=8000,
             system=SKILL_PROMPT,
             messages=[{"role": "user", "content": user_content}],
             tools=[{"type": "code_execution_20250522", "name": "code_execution"}],
-        )
+        ) as stream:
+            # Drain the event stream — this keeps bytes flowing on the wire so
+            # Render's 300s idle timeout never trips, no matter how long Claude takes.
+            for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "content_block_start":
+                    block = getattr(event, "content_block", None)
+                    if block and getattr(block, "type", "") == "tool_use":
+                        log.info(f"[{run_id}] tool use started: {getattr(block, 'name', '?')}")
+                elif etype == "message_stop":
+                    log.info(f"[{run_id}] message_stop received")
+            final_message = stream.get_final_message()
     except anthropic.APIError as e:
-        log.exception(f"[{run_id}] Claude API error")
+        log.exception(f"[{run_id}] Claude API error during stream")
         return jsonify(error=f"Claude API error: {e}"), 502
 
-    log.info(f"[{run_id}] response received, stop_reason={response.stop_reason}")
+    log.info(f"[{run_id}] stream complete, stop_reason={final_message.stop_reason}")
 
-    xlsx_bytes = extract_xlsx_from_response(response)
+    xlsx_bytes = extract_xlsx_from_message(final_message)
     if not xlsx_bytes:
-        text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+        text_blocks = [b.text for b in final_message.content if getattr(b, "type", None) == "text"]
         msg = "\n".join(text_blocks) or "No file produced and no text response."
         log.warning(f"[{run_id}] no xlsx produced. Claude said: {msg[:500]}")
         return jsonify(error="No spreadsheet was produced.", claude_response=msg), 422
