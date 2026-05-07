@@ -193,7 +193,7 @@ def spreadsheet_quotes():
         user_content.append(file_to_block(f))
 
     try:
-        response = client.messages.create(
+        response = client.beta.messages.create(
             model=MODEL,
             max_tokens=8000,
             system=SKILL_PROMPT,
